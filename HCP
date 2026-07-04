@@ -1,0 +1,977 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    HouseCallPro - PowerShell module for the Housecall Pro Public API.
+
+.DESCRIPTION
+    Wraps the Housecall Pro Public API (https://docs.housecallpro.com/) with
+    PowerShell-friendly cmdlets. Covers customers, leads, jobs, line items,
+    appointments, estimates, invoices, payments, employees, companies, and
+    webhook subscriptions.
+
+    Authentication: the API is available to Pros on the MAX plan. Generate an
+    API key from the App Store API card in Housecall Pro, then run:
+
+        Connect-HCPApi -ApiKey 'your-key-here'
+
+    NOTE: All monetary amounts returned by the API are integers in cents.
+#>
+
+# ---------------------------------------------------------------------------
+# Module state
+# ---------------------------------------------------------------------------
+
+$script:HCPConfig = [pscustomobject]@{
+    BaseUri    = 'https://api.housecallpro.com'
+    ApiKey     = $null          # SecureString
+    AuthScheme = 'Token'        # 'Token' (API key) or 'Bearer' (OAuth access token)
+    MaxRetries = 3
+}
+
+$script:HCPCredentialPath = Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'HouseCallPro\connection.xml'
+
+function ConvertFrom-SecureStringPlain {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][securestring]$SecureString)
+
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
+    try {
+        [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+    }
+    finally {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Connection management
+# ---------------------------------------------------------------------------
+
+function Connect-HCPApi {
+    <#
+    .SYNOPSIS
+        Stores the Housecall Pro API key for use by the other cmdlets.
+    .PARAMETER ApiKey
+        The API key from your Housecall Pro App Store API card. Accepts a
+        plain string or a SecureString.
+    .PARAMETER AuthScheme
+        'Token' for API keys (default) or 'Bearer' for OAuth 2.0 access tokens.
+    .PARAMETER BaseUri
+        Override the API base URI. Defaults to https://api.housecallpro.com.
+    .PARAMETER Persist
+        Save the connection (DPAPI-encrypted, current user/machine only) so
+        future sessions reconnect automatically on module import.
+    .EXAMPLE
+        Connect-HCPApi -ApiKey 'abc123' -Persist
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [object]$ApiKey,
+
+        [ValidateSet('Token', 'Bearer')]
+        [string]$AuthScheme = 'Token',
+
+        [string]$BaseUri,
+
+        [switch]$Persist
+    )
+
+    $secure = if ($ApiKey -is [securestring]) { $ApiKey }
+              else { ConvertTo-SecureString -String ([string]$ApiKey) -AsPlainText -Force }
+
+    $script:HCPConfig.ApiKey     = $secure
+    $script:HCPConfig.AuthScheme = $AuthScheme
+    if ($BaseUri) { $script:HCPConfig.BaseUri = $BaseUri.TrimEnd('/') }
+
+    if ($Persist) {
+        $dir = Split-Path $script:HCPCredentialPath -Parent
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        [pscustomobject]@{
+            ApiKey     = $secure | ConvertFrom-SecureString
+            AuthScheme = $script:HCPConfig.AuthScheme
+            BaseUri    = $script:HCPConfig.BaseUri
+        } | Export-Clixml -Path $script:HCPCredentialPath
+        Write-Verbose "Connection saved to $script:HCPCredentialPath"
+    }
+
+    Write-Verbose "Connected to $($script:HCPConfig.BaseUri) using $AuthScheme auth."
+}
+
+function Disconnect-HCPApi {
+    <#
+    .SYNOPSIS
+        Clears the stored API key and removes any persisted connection.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $script:HCPConfig.ApiKey = $null
+    if (Test-Path $script:HCPCredentialPath) {
+        Remove-Item $script:HCPCredentialPath -Force
+    }
+}
+
+function Get-HCPConnection {
+    <#
+    .SYNOPSIS
+        Shows the current connection settings (the key itself is not revealed).
+    #>
+    [CmdletBinding()]
+    param()
+
+    [pscustomobject]@{
+        BaseUri    = $script:HCPConfig.BaseUri
+        AuthScheme = $script:HCPConfig.AuthScheme
+        Connected  = [bool]$script:HCPConfig.ApiKey
+        Persisted  = Test-Path $script:HCPCredentialPath
+    }
+}
+
+function Restore-HCPConnection {
+    # Internal: reload a persisted connection on module import.
+    if (Test-Path $script:HCPCredentialPath) {
+        try {
+            $saved = Import-Clixml -Path $script:HCPCredentialPath
+            $script:HCPConfig.ApiKey     = $saved.ApiKey | ConvertTo-SecureString
+            $script:HCPConfig.AuthScheme = $saved.AuthScheme
+            $script:HCPConfig.BaseUri    = $saved.BaseUri
+        }
+        catch {
+            Write-Warning "Could not restore saved Housecall Pro connection: $_"
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Core request engine
+# ---------------------------------------------------------------------------
+
+function Invoke-HCPApi {
+    <#
+    .SYNOPSIS
+        Sends a raw request to the Housecall Pro API. Used by every other
+        cmdlet; also exported for endpoints not yet wrapped.
+    .PARAMETER Method
+        HTTP method (GET, POST, PUT, PATCH, DELETE).
+    .PARAMETER Path
+        Path relative to the base URI, e.g. '/customers' or 'jobs/job_123'.
+    .PARAMETER Query
+        Hashtable of query string parameters. Array values are repeated
+        (e.g. employee_ids[]).
+    .PARAMETER Body
+        Hashtable or PSCustomObject serialized to JSON for the request body.
+    .EXAMPLE
+        Invoke-HCPApi -Method GET -Path '/customers' -Query @{ page_size = 50 }
+    #>
+    [CmdletBinding()]
+    param(
+        [ValidateSet('GET', 'POST', 'PUT', 'PATCH', 'DELETE')]
+        [string]$Method = 'GET',
+
+        [Parameter(Mandatory, Position = 0)]
+        [string]$Path,
+
+        [hashtable]$Query,
+
+        [object]$Body
+    )
+
+    if (-not $script:HCPConfig.ApiKey) {
+        throw "Not connected to the Housecall Pro API. Run Connect-HCPApi first."
+    }
+
+    # Build URI with query string
+    $uri = '{0}/{1}' -f $script:HCPConfig.BaseUri, $Path.TrimStart('/')
+    if ($Query -and $Query.Count -gt 0) {
+        $pairs = foreach ($key in $Query.Keys) {
+            $value = $Query[$key]
+            if ($null -eq $value) { continue }
+            if ($value -is [System.Collections.IEnumerable] -and $value -isnot [string]) {
+                foreach ($item in $value) {
+                    '{0}={1}' -f [uri]::EscapeDataString("$key[]"), [uri]::EscapeDataString([string]$item)
+                }
+            }
+            else {
+                '{0}={1}' -f [uri]::EscapeDataString($key), [uri]::EscapeDataString([string]$value)
+            }
+        }
+        if ($pairs) { $uri += '?' + ($pairs -join '&') }
+    }
+
+    $plainKey = ConvertFrom-SecureStringPlain -SecureString $script:HCPConfig.ApiKey
+    $headers = @{
+        Authorization = '{0} {1}' -f $script:HCPConfig.AuthScheme, $plainKey
+        Accept        = 'application/json'
+    }
+
+    $requestParams = @{
+        Method      = $Method
+        Uri         = $uri
+        Headers     = $headers
+        ErrorAction = 'Stop'
+    }
+    if ($null -ne $Body) {
+        $requestParams.Body        = ($Body | ConvertTo-Json -Depth 20)
+        $requestParams.ContentType = 'application/json'
+    }
+
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        try {
+            Write-Verbose "$Method $uri (attempt $attempt)"
+            return Invoke-RestMethod @requestParams
+        }
+        catch {
+            $statusCode = $null
+            $retryAfter = $null
+            if ($_.Exception.Response) {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+                try { $retryAfter = $_.Exception.Response.Headers['Retry-After'] } catch { }
+            }
+
+            # Retry on rate limiting and transient server errors
+            $retryable = $statusCode -in 429, 500, 502, 503, 504
+            if ($retryable -and $attempt -le $script:HCPConfig.MaxRetries) {
+                $delay = if ($retryAfter) { [double]$retryAfter } else { [math]::Pow(2, $attempt) }
+                Write-Warning "HTTP $statusCode from Housecall Pro; retrying in $delay second(s)..."
+                Start-Sleep -Seconds $delay
+                continue
+            }
+
+            # Surface the API's error body when available
+            $detail = $null
+            try {
+                if ($_.ErrorDetails.Message) { $detail = $_.ErrorDetails.Message }
+                elseif ($_.Exception.Response -and $_.Exception.Response.GetResponseStream) {
+                    $reader = [IO.StreamReader]::new($_.Exception.Response.GetResponseStream())
+                    $detail = $reader.ReadToEnd()
+                }
+            }
+            catch { }
+
+            $message = "Housecall Pro API request failed: $Method $uri"
+            if ($statusCode) { $message += " (HTTP $statusCode)" }
+            if ($detail)     { $message += "`n$detail" }
+            throw $message
+        }
+    }
+}
+
+function Invoke-HCPPagedApi {
+    # Internal: GET a collection endpoint, unwrapping the named collection
+    # property and optionally following page/page_size pagination to the end.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$CollectionName,
+        [hashtable]$Query = @{},
+        [switch]$All
+    )
+
+    $query = @{} + $Query
+    if (-not $query.ContainsKey('page_size')) { $query.page_size = 100 }
+    $page = if ($query.ContainsKey('page')) { [int]$query.page } else { 1 }
+
+    do {
+        $query.page = $page
+        $response = Invoke-HCPApi -Method GET -Path $Path -Query $query
+
+        $items = if ($response.PSObject.Properties[$CollectionName]) { $response.$CollectionName }
+                 else { $response }
+        if ($null -eq $items) { break }
+        $items | Write-Output
+
+        $count = @($items).Count
+        $page++
+    } while ($All -and $count -eq [int]$query.page_size)
+}
+
+# ---------------------------------------------------------------------------
+# Customers
+# ---------------------------------------------------------------------------
+
+function Get-HCPCustomer {
+    <#
+    .SYNOPSIS
+        Gets a single customer by ID, or lists/searches customers.
+    .PARAMETER CustomerId
+        Return only this customer.
+    .PARAMETER Search
+        Free-text search (the API's 'q' parameter).
+    .PARAMETER All
+        Follow pagination and return every matching customer.
+    .EXAMPLE
+        Get-HCPCustomer -Search 'smith'
+    .EXAMPLE
+        Get-HCPCustomer -All
+    #>
+    [CmdletBinding(DefaultParameterSetName = 'List')]
+    param(
+        [Parameter(ParameterSetName = 'ById', Mandatory, Position = 0, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [Alias('id')]
+        [string]$CustomerId,
+
+        [Parameter(ParameterSetName = 'List')]
+        [Alias('q')]
+        [string]$Search,
+
+        [Parameter(ParameterSetName = 'List')]
+        [int]$Page,
+
+        [Parameter(ParameterSetName = 'List')]
+        [int]$PageSize,
+
+        [Parameter(ParameterSetName = 'List')]
+        [switch]$All
+    )
+
+    process {
+        if ($PSCmdlet.ParameterSetName -eq 'ById') {
+            return Invoke-HCPApi -Method GET -Path "/customers/$CustomerId"
+        }
+
+        $query = @{}
+        if ($Search)   { $query.q = $Search }
+        if ($Page)     { $query.page = $Page }
+        if ($PageSize) { $query.page_size = $PageSize }
+        Invoke-HCPPagedApi -Path '/customers' -CollectionName 'customers' -Query $query -All:$All
+    }
+}
+
+function New-HCPCustomer {
+    <#
+    .SYNOPSIS
+        Creates a customer.
+    .PARAMETER Addresses
+        Array of address hashtables, e.g.
+        @{ type='service'; street='123 Main St'; city='Austin'; state='TX'; zip='78701' }
+    .PARAMETER Properties
+        Extra body fields to pass through verbatim (merged last).
+    .EXAMPLE
+        New-HCPCustomer -FirstName 'Jane' -LastName 'Doe' -Email 'jane@example.com' -MobileNumber '5125550100'
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [string]$FirstName,
+        [string]$LastName,
+        [string]$Email,
+        [string]$MobileNumber,
+        [string]$HomeNumber,
+        [string]$WorkNumber,
+        [string]$Company,
+        [bool]$NotificationsEnabled,
+        [string]$LeadSource,
+        [string[]]$Tags,
+        [hashtable[]]$Addresses,
+        [hashtable]$Properties
+    )
+
+    $body = @{}
+    if ($PSBoundParameters.ContainsKey('FirstName'))            { $body.first_name = $FirstName }
+    if ($PSBoundParameters.ContainsKey('LastName'))             { $body.last_name = $LastName }
+    if ($PSBoundParameters.ContainsKey('Email'))                { $body.email = $Email }
+    if ($PSBoundParameters.ContainsKey('MobileNumber'))         { $body.mobile_number = $MobileNumber }
+    if ($PSBoundParameters.ContainsKey('HomeNumber'))           { $body.home_number = $HomeNumber }
+    if ($PSBoundParameters.ContainsKey('WorkNumber'))           { $body.work_number = $WorkNumber }
+    if ($PSBoundParameters.ContainsKey('Company'))              { $body.company = $Company }
+    if ($PSBoundParameters.ContainsKey('NotificationsEnabled')) { $body.notifications_enabled = $NotificationsEnabled }
+    if ($PSBoundParameters.ContainsKey('LeadSource'))           { $body.lead_source = $LeadSource }
+    if ($PSBoundParameters.ContainsKey('Tags'))                 { $body.tags = $Tags }
+    if ($PSBoundParameters.ContainsKey('Addresses'))            { $body.addresses = $Addresses }
+    if ($Properties) { foreach ($key in $Properties.Keys) { $body[$key] = $Properties[$key] } }
+
+    $display = (@($FirstName, $LastName) -join ' ').Trim()
+    if (-not $display) { $display = $Company }
+    if ($PSCmdlet.ShouldProcess($display, 'Create Housecall Pro customer')) {
+        Invoke-HCPApi -Method POST -Path '/customers' -Body $body
+    }
+}
+
+function Set-HCPCustomer {
+    <#
+    .SYNOPSIS
+        Updates a customer.
+    .EXAMPLE
+        Set-HCPCustomer -CustomerId cus_123 -Email 'new@example.com'
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory, Position = 0, ValueFromPipelineByPropertyName)]
+        [Alias('id')]
+        [string]$CustomerId,
+
+        [string]$FirstName,
+        [string]$LastName,
+        [string]$Email,
+        [string]$MobileNumber,
+        [string]$HomeNumber,
+        [string]$WorkNumber,
+        [string]$Company,
+        [bool]$NotificationsEnabled,
+        [string]$LeadSource,
+        [string[]]$Tags,
+        [hashtable[]]$Addresses,
+        [hashtable]$Properties
+    )
+
+    process {
+        $body = @{}
+        if ($PSBoundParameters.ContainsKey('FirstName'))            { $body.first_name = $FirstName }
+        if ($PSBoundParameters.ContainsKey('LastName'))             { $body.last_name = $LastName }
+        if ($PSBoundParameters.ContainsKey('Email'))                { $body.email = $Email }
+        if ($PSBoundParameters.ContainsKey('MobileNumber'))         { $body.mobile_number = $MobileNumber }
+        if ($PSBoundParameters.ContainsKey('HomeNumber'))           { $body.home_number = $HomeNumber }
+        if ($PSBoundParameters.ContainsKey('WorkNumber'))           { $body.work_number = $WorkNumber }
+        if ($PSBoundParameters.ContainsKey('Company'))              { $body.company = $Company }
+        if ($PSBoundParameters.ContainsKey('NotificationsEnabled')) { $body.notifications_enabled = $NotificationsEnabled }
+        if ($PSBoundParameters.ContainsKey('LeadSource'))           { $body.lead_source = $LeadSource }
+        if ($PSBoundParameters.ContainsKey('Tags'))                 { $body.tags = $Tags }
+        if ($PSBoundParameters.ContainsKey('Addresses'))            { $body.addresses = $Addresses }
+        if ($Properties) { foreach ($key in $Properties.Keys) { $body[$key] = $Properties[$key] } }
+
+        if ($body.Count -eq 0) { throw 'Specify at least one property to update.' }
+
+        if ($PSCmdlet.ShouldProcess($CustomerId, 'Update Housecall Pro customer')) {
+            Invoke-HCPApi -Method PUT -Path "/customers/$CustomerId" -Body $body
+        }
+    }
+}
+
+function Remove-HCPCustomer {
+    <#
+    .SYNOPSIS
+        Deletes a customer. Prompts for confirmation by default.
+    .EXAMPLE
+        Remove-HCPCustomer -CustomerId cus_123
+    #>
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
+    param(
+        [Parameter(Mandatory, Position = 0, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [Alias('id')]
+        [string]$CustomerId
+    )
+
+    process {
+        if ($PSCmdlet.ShouldProcess($CustomerId, 'Delete Housecall Pro customer')) {
+            Invoke-HCPApi -Method DELETE -Path "/customers/$CustomerId" | Out-Null
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Leads
+# ---------------------------------------------------------------------------
+
+function Get-HCPLead {
+    <#
+    .SYNOPSIS
+        Lists job-inbox leads.
+    #>
+    [CmdletBinding()]
+    param(
+        [int]$Page,
+        [int]$PageSize,
+        [switch]$All
+    )
+
+    $query = @{}
+    if ($Page)     { $query.page = $Page }
+    if ($PageSize) { $query.page_size = $PageSize }
+    Invoke-HCPPagedApi -Path '/leads' -CollectionName 'leads' -Query $query -All:$All
+}
+
+function New-HCPLead {
+    <#
+    .SYNOPSIS
+        Creates a job-inbox lead.
+    .PARAMETER Body
+        Hashtable with the lead payload (customer info, description, etc.).
+    .EXAMPLE
+        New-HCPLead -Body @{ customer = @{ first_name='Sam'; mobile_number='5125550142' }; description = 'Water heater replacement' }
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [hashtable]$Body
+    )
+
+    if ($PSCmdlet.ShouldProcess('lead', 'Create Housecall Pro lead')) {
+        Invoke-HCPApi -Method POST -Path '/leads' -Body $Body
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Jobs
+# ---------------------------------------------------------------------------
+
+function Get-HCPJob {
+    <#
+    .SYNOPSIS
+        Gets a single job by ID, or lists jobs with optional filters.
+    .PARAMETER ScheduledStartMin
+        Only jobs whose scheduled start is at or after this time.
+    .PARAMETER ScheduledStartMax
+        Only jobs whose scheduled start is at or before this time.
+    .PARAMETER EmployeeIds
+        Only jobs assigned to these employee IDs.
+    .EXAMPLE
+        Get-HCPJob -ScheduledStartMin (Get-Date).Date -ScheduledStartMax (Get-Date).Date.AddDays(1) -All
+    #>
+    [CmdletBinding(DefaultParameterSetName = 'List')]
+    param(
+        [Parameter(ParameterSetName = 'ById', Mandatory, Position = 0, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [Alias('id')]
+        [string]$JobId,
+
+        [Parameter(ParameterSetName = 'List')]
+        [string]$CustomerId,
+
+        [Parameter(ParameterSetName = 'List')]
+        [datetime]$ScheduledStartMin,
+
+        [Parameter(ParameterSetName = 'List')]
+        [datetime]$ScheduledStartMax,
+
+        [Parameter(ParameterSetName = 'List')]
+        [string[]]$EmployeeIds,
+
+        [Parameter(ParameterSetName = 'List')]
+        [int]$Page,
+
+        [Parameter(ParameterSetName = 'List')]
+        [int]$PageSize,
+
+        [Parameter(ParameterSetName = 'List')]
+        [switch]$All
+    )
+
+    process {
+        if ($PSCmdlet.ParameterSetName -eq 'ById') {
+            return Invoke-HCPApi -Method GET -Path "/jobs/$JobId"
+        }
+
+        $query = @{}
+        if ($CustomerId)        { $query.customer_id = $CustomerId }
+        if ($ScheduledStartMin) { $query.scheduled_start_min = $ScheduledStartMin.ToUniversalTime().ToString('o') }
+        if ($ScheduledStartMax) { $query.scheduled_start_max = $ScheduledStartMax.ToUniversalTime().ToString('o') }
+        if ($EmployeeIds)       { $query.employee_ids = $EmployeeIds }
+        if ($Page)              { $query.page = $Page }
+        if ($PageSize)          { $query.page_size = $PageSize }
+        Invoke-HCPPagedApi -Path '/jobs' -CollectionName 'jobs' -Query $query -All:$All
+    }
+}
+
+function New-HCPJob {
+    <#
+    .SYNOPSIS
+        Creates a job.
+    .PARAMETER Body
+        Hashtable with the full job payload. Common fields: customer_id,
+        address_id (or address), schedule (scheduled_start/scheduled_end/
+        arrival_window), assigned_employee_ids, line_items, notes, tags.
+    .EXAMPLE
+        New-HCPJob -Body @{
+            customer_id = 'cus_123'
+            schedule    = @{ scheduled_start = '2026-07-10T14:00:00Z'; scheduled_end = '2026-07-10T16:00:00Z'; arrival_window = 60 }
+            line_items  = @(@{ name = 'Service call'; unit_price = 9900; quantity = 1 })
+        }
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [hashtable]$Body
+    )
+
+    if ($PSCmdlet.ShouldProcess('job', 'Create Housecall Pro job')) {
+        Invoke-HCPApi -Method POST -Path '/jobs' -Body $Body
+    }
+}
+
+function Set-HCPJob {
+    <#
+    .SYNOPSIS
+        Updates a job.
+    .EXAMPLE
+        Set-HCPJob -JobId job_123 -Body @{ notes = 'Customer prefers afternoon arrival.' }
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory, Position = 0, ValueFromPipelineByPropertyName)]
+        [Alias('id')]
+        [string]$JobId,
+
+        [Parameter(Mandatory, Position = 1)]
+        [hashtable]$Body
+    )
+
+    process {
+        if ($PSCmdlet.ShouldProcess($JobId, 'Update Housecall Pro job')) {
+            Invoke-HCPApi -Method PUT -Path "/jobs/$JobId" -Body $Body
+        }
+    }
+}
+
+function Remove-HCPJob {
+    <#
+    .SYNOPSIS
+        Deletes a job. Prompts for confirmation by default.
+    #>
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
+    param(
+        [Parameter(Mandatory, Position = 0, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [Alias('id')]
+        [string]$JobId
+    )
+
+    process {
+        if ($PSCmdlet.ShouldProcess($JobId, 'Delete Housecall Pro job')) {
+            Invoke-HCPApi -Method DELETE -Path "/jobs/$JobId" | Out-Null
+        }
+    }
+}
+
+function Get-HCPJobLineItem {
+    <#
+    .SYNOPSIS
+        Lists the line items on a job.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, Position = 0, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [Alias('id')]
+        [string]$JobId
+    )
+
+    process {
+        Invoke-HCPPagedApi -Path "/jobs/$JobId/line_items" -CollectionName 'line_items'
+    }
+}
+
+function New-HCPJobLineItem {
+    <#
+    .SYNOPSIS
+        Adds a line item to a job. Unit prices are in cents.
+    .EXAMPLE
+        New-HCPJobLineItem -JobId job_123 -Name 'Filter replacement' -UnitPrice 4500 -Quantity 2
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory, Position = 0, ValueFromPipelineByPropertyName)]
+        [Alias('id')]
+        [string]$JobId,
+
+        [Parameter(Mandatory)]
+        [string]$Name,
+
+        [string]$Description,
+
+        [Parameter(Mandatory)]
+        [int]$UnitPrice,
+
+        [double]$Quantity = 1,
+
+        [int]$UnitCost,
+
+        [hashtable]$Properties
+    )
+
+    process {
+        $body = @{
+            name       = $Name
+            unit_price = $UnitPrice
+            quantity   = $Quantity
+        }
+        if ($PSBoundParameters.ContainsKey('Description')) { $body.description = $Description }
+        if ($PSBoundParameters.ContainsKey('UnitCost'))    { $body.unit_cost = $UnitCost }
+        if ($Properties) { foreach ($key in $Properties.Keys) { $body[$key] = $Properties[$key] } }
+
+        if ($PSCmdlet.ShouldProcess($JobId, "Add line item '$Name'")) {
+            Invoke-HCPApi -Method POST -Path "/jobs/$JobId/line_items" -Body $body
+        }
+    }
+}
+
+function Get-HCPJobAppointment {
+    <#
+    .SYNOPSIS
+        Lists the appointments (schedule items) on a job.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, Position = 0, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [Alias('id')]
+        [string]$JobId
+    )
+
+    process {
+        Invoke-HCPPagedApi -Path "/jobs/$JobId/appointments" -CollectionName 'appointments'
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Estimates
+# ---------------------------------------------------------------------------
+
+function Get-HCPEstimate {
+    <#
+    .SYNOPSIS
+        Gets a single estimate by ID, or lists estimates.
+    #>
+    [CmdletBinding(DefaultParameterSetName = 'List')]
+    param(
+        [Parameter(ParameterSetName = 'ById', Mandatory, Position = 0, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [Alias('id')]
+        [string]$EstimateId,
+
+        [Parameter(ParameterSetName = 'List')]
+        [int]$Page,
+
+        [Parameter(ParameterSetName = 'List')]
+        [int]$PageSize,
+
+        [Parameter(ParameterSetName = 'List')]
+        [switch]$All
+    )
+
+    process {
+        if ($PSCmdlet.ParameterSetName -eq 'ById') {
+            return Invoke-HCPApi -Method GET -Path "/estimates/$EstimateId"
+        }
+
+        $query = @{}
+        if ($Page)     { $query.page = $Page }
+        if ($PageSize) { $query.page_size = $PageSize }
+        Invoke-HCPPagedApi -Path '/estimates' -CollectionName 'estimates' -Query $query -All:$All
+    }
+}
+
+function New-HCPEstimate {
+    <#
+    .SYNOPSIS
+        Creates an estimate.
+    .PARAMETER Body
+        Hashtable with the estimate payload (customer_id, options with line
+        items, etc.).
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [hashtable]$Body
+    )
+
+    if ($PSCmdlet.ShouldProcess('estimate', 'Create Housecall Pro estimate')) {
+        Invoke-HCPApi -Method POST -Path '/estimates' -Body $Body
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Invoices & payments
+# ---------------------------------------------------------------------------
+
+function Get-HCPInvoice {
+    <#
+    .SYNOPSIS
+        Gets a single invoice by ID, or lists invoices.
+    #>
+    [CmdletBinding(DefaultParameterSetName = 'List')]
+    param(
+        [Parameter(ParameterSetName = 'ById', Mandatory, Position = 0, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [Alias('id')]
+        [string]$InvoiceId,
+
+        [Parameter(ParameterSetName = 'List')]
+        [int]$Page,
+
+        [Parameter(ParameterSetName = 'List')]
+        [int]$PageSize,
+
+        [Parameter(ParameterSetName = 'List')]
+        [switch]$All
+    )
+
+    process {
+        if ($PSCmdlet.ParameterSetName -eq 'ById') {
+            return Invoke-HCPApi -Method GET -Path "/invoices/$InvoiceId"
+        }
+
+        $query = @{}
+        if ($Page)     { $query.page = $Page }
+        if ($PageSize) { $query.page_size = $PageSize }
+        Invoke-HCPPagedApi -Path '/invoices' -CollectionName 'invoices' -Query $query -All:$All
+    }
+}
+
+function New-HCPInvoice {
+    <#
+    .SYNOPSIS
+        Creates an invoice.
+    .PARAMETER Body
+        Hashtable with the invoice payload.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [hashtable]$Body
+    )
+
+    if ($PSCmdlet.ShouldProcess('invoice', 'Create Housecall Pro invoice')) {
+        Invoke-HCPApi -Method POST -Path '/invoices' -Body $Body
+    }
+}
+
+function Get-HCPInvoicePayment {
+    <#
+    .SYNOPSIS
+        Lists the payments processed against an invoice.
+    .EXAMPLE
+        Get-HCPInvoice -All | Get-HCPInvoicePayment
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, Position = 0, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [Alias('id')]
+        [string]$InvoiceId
+    )
+
+    process {
+        Invoke-HCPPagedApi -Path "/invoices/$InvoiceId/payments" -CollectionName 'payments'
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Employees & companies
+# ---------------------------------------------------------------------------
+
+function Get-HCPEmployee {
+    <#
+    .SYNOPSIS
+        Gets a single employee by ID, or lists all employees (field techs,
+        office staff, and admins).
+    #>
+    [CmdletBinding(DefaultParameterSetName = 'List')]
+    param(
+        [Parameter(ParameterSetName = 'ById', Mandatory, Position = 0, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [Alias('id')]
+        [string]$EmployeeId,
+
+        [Parameter(ParameterSetName = 'List')]
+        [switch]$All
+    )
+
+    process {
+        if ($PSCmdlet.ParameterSetName -eq 'ById') {
+            return Invoke-HCPApi -Method GET -Path "/employees/$EmployeeId"
+        }
+        Invoke-HCPPagedApi -Path '/employees' -CollectionName 'employees' -All:$All
+    }
+}
+
+function Get-HCPCompany {
+    <#
+    .SYNOPSIS
+        Lists the companies visible to the API key.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Invoke-HCPPagedApi -Path '/companies' -CollectionName 'companies'
+}
+
+# ---------------------------------------------------------------------------
+# Webhooks
+# ---------------------------------------------------------------------------
+
+function Get-HCPWebhook {
+    <#
+    .SYNOPSIS
+        Lists webhook subscriptions.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Invoke-HCPPagedApi -Path '/webhooks' -CollectionName 'webhooks'
+}
+
+function New-HCPWebhook {
+    <#
+    .SYNOPSIS
+        Creates a webhook subscription. Events cover customer, estimate,
+        invoice, job, lead, and payment changes.
+    .EXAMPLE
+        New-HCPWebhook -Url 'https://example.com/hcp-hook' -Events 'job.completed','invoice.paid'
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [string]$Url,
+
+        [string[]]$Events,
+
+        [hashtable]$Properties
+    )
+
+    $body = @{ url = $Url }
+    if ($Events)     { $body.events = $Events }
+    if ($Properties) { foreach ($key in $Properties.Keys) { $body[$key] = $Properties[$key] } }
+
+    if ($PSCmdlet.ShouldProcess($Url, 'Create Housecall Pro webhook subscription')) {
+        Invoke-HCPApi -Method POST -Path '/webhooks' -Body $body
+    }
+}
+
+function Remove-HCPWebhook {
+    <#
+    .SYNOPSIS
+        Deletes a webhook subscription.
+    #>
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
+    param(
+        [Parameter(Mandatory, Position = 0, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [Alias('id')]
+        [string]$WebhookId
+    )
+
+    process {
+        if ($PSCmdlet.ShouldProcess($WebhookId, 'Delete Housecall Pro webhook subscription')) {
+            Invoke-HCPApi -Method DELETE -Path "/webhooks/$WebhookId" | Out-Null
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Module initialization
+# ---------------------------------------------------------------------------
+
+Restore-HCPConnection
+
+Export-ModuleMember -Function @(
+    'Connect-HCPApi'
+    'Disconnect-HCPApi'
+    'Get-HCPConnection'
+    'Invoke-HCPApi'
+    'Get-HCPCustomer'
+    'New-HCPCustomer'
+    'Set-HCPCustomer'
+    'Remove-HCPCustomer'
+    'Get-HCPLead'
+    'New-HCPLead'
+    'Get-HCPJob'
+    'New-HCPJob'
+    'Set-HCPJob'
+    'Remove-HCPJob'
+    'Get-HCPJobLineItem'
+    'New-HCPJobLineItem'
+    'Get-HCPJobAppointment'
+    'Get-HCPEstimate'
+    'New-HCPEstimate'
+    'Get-HCPInvoice'
+    'New-HCPInvoice'
+    'Get-HCPInvoicePayment'
+    'Get-HCPEmployee'
+    'Get-HCPCompany'
+    'Get-HCPWebhook'
+    'New-HCPWebhook'
+    'Remove-HCPWebhook'
+)
