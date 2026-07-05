@@ -729,8 +729,6 @@ function Get-HCPEstimate {
         [Alias('estuid')]
         [string]$EstimateId,
 
-cus_1cbe0193bf564fb88e028538b3261d5f
-
         [Parameter(ParameterSetName = 'List')]
         [int]$Page,
 
