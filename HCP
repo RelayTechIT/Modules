@@ -519,6 +519,17 @@ function Get-HCPJob {
     .EXAMPLE
         Get-HCPJob -ScheduledStartMin (Get-Date).Date -ScheduledStartMax (Get-Date).Date.AddDays(1) -All
     #>
+
+    [CmdletBinding(DefaultParameterSetName = 'List')]
+    param(
+        [Parameter(ParameterSetName = 'CustId', Mandatory, Position = 0, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [Alias('cusuid')]
+        [string]$CustomerId,
+
+        [Parameter(ParameterSetName = 'JobId', Mandatory, Position = 0, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [Alias('jobuid')]
+        [string]JobId,
+
     [CmdletBinding(DefaultParameterSetName = 'List')]
     param(
         [Parameter(ParameterSetName = 'ById', Mandatory, Position = 0, ValueFromPipeline, ValueFromPipelineByPropertyName)]
@@ -548,7 +559,10 @@ function Get-HCPJob {
     )
 
     process {
-        if ($PSCmdlet.ParameterSetName -eq 'ById') {
+        if ($PSCmdlet.ParameterSetName -eq 'CustId') {
+            return Invoke-HCPApi -Method GET -Path "/jobs?customer_id=$($CustomerId)"
+        }
+        if ($PSCmdlet.ParameterSetName -eq 'JobId') {
             return Invoke-HCPApi -Method GET -Path "/jobs/$JobId"
         }
 
