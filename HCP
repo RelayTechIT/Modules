@@ -721,9 +721,15 @@ function Get-HCPEstimate {
     #>
     [CmdletBinding(DefaultParameterSetName = 'List')]
     param(
-        [Parameter(ParameterSetName = 'ById', Mandatory, Position = 0, ValueFromPipeline, ValueFromPipelineByPropertyName)]
-        [Alias('id')]
+        [Parameter(ParameterSetName = 'CustId', Mandatory, Position = 0, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [Alias('cusuid')]
+        [string]$CustomerId,
+
+        [Parameter(ParameterSetName = 'EstId', Mandatory, Position = 0, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [Alias('estuid')]
         [string]$EstimateId,
+
+cus_1cbe0193bf564fb88e028538b3261d5f
 
         [Parameter(ParameterSetName = 'List')]
         [int]$Page,
@@ -736,7 +742,11 @@ function Get-HCPEstimate {
     )
 
     process {
-        if ($PSCmdlet.ParameterSetName -eq 'ById') {
+        if ($PSCmdlet.ParameterSetName -eq 'CustId') {
+            return Invoke-HCPApi -Method GET -Path "/estimates?customer_id=$($CustomerId)"
+        }
+
+        if ($PSCmdlet.ParameterSetName -eq 'EstId') {
             return Invoke-HCPApi -Method GET -Path "/estimates/$EstimateId"
         }
 
