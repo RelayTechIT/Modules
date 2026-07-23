@@ -1,1 +1,29 @@
 
+function Export-PrinterInfo {
+    param (
+        $PrinterDisplayName,
+        $ExportDir = "C:\RTSupport\PrinterExport"
+    )
+    if (!$PrinterDisplayName) {$PrinterDisplayName = Read-Host -Prompt "Enter the name of the printer to export"}
+    if (!(Test-Path $ExportDir)) {new-item $ExportDir -ItemType Directory -Force > $null};   
+    $prtr = Get-Printer -Name $PrinterDisplayName;
+    $drvr = Get-PrinterDriver -Name $prtr.DriverName;
+    $port = Get-PrinterPort -Name $prtr.PortName;
+    $ExportDriverZipPath = "$($ExportDir)\$($drvr.Name.Replace('(','').replace(')','').replace(' ','_'))_$($drvr.PrinterEnvironment.replace(' ','_')).zip"
+
+    Write-Host "";
+    Write-Host "Copy this stuff down";
+    Write-Host "";
+    Write-Host "Printer Display Name:           $($Prtr.Name)";
+    Write-Host "Printer Driver Name:            $($Prtr.DriverName)";
+    Write-Host "Printer Driver Environment:     $($drvr.PrinterEnvironment)";
+    Write-Host "HostOrIPAddress:                $($port.PrinterHostAddress)";
+    Write-Host "Driver .inf file:               $($drvr.InfPath.split('\')[-1])";
+    Write-Host "Driver Export.zip path:         $($ExportDriverZipPath)";
+
+    $gci = gci $drvr.InfPath; 
+    Compress-Archive -Path $gci.DirectoryName -DestinationPath $ExportDriverZipPath;
+    
+    Write-Host "";
+    Write-Host "Driver Exported Successfully";
+}
