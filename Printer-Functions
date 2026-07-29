@@ -1,0 +1,121 @@
+function Add-LocalIPPrinter {
+    param (
+        $PrinterDisplayName,
+        $PrinterDriverName,
+        $PrinterHostorIPAddress,
+        $PrinterInfFile,
+        $PrinterInfPath,
+        [switch]$DefaultPrinter
+    )
+
+    try {
+        if (!(Test-Path $PrinterInfPath)) {
+            Throw "InfPath $($PrinterInfPath) missing"
+        }
+        if ($PrinterInfPath.split('.')[-1] -eq "zip") {
+            Expand-Archive -Path $PrinterInfPath -DestinationPath $PrinterInfPath.replace('.zip','')
+        } else {
+            $gci = gci "$($PrinterInfPath)\$($PrinterInfFile)" -Recurse | select -First 1
+            $InfFileInstallPath = $gci.FullName
+        }
+
+        # - Add the Driver to windows
+            & pnputil.exe /a $InfFileInstallPath
+            if ($LASTEXITCODE -ne 0) {Throw "An error occurred while adding the printer driver. Please check the log for details."}
+                Write-Host "Installed driver for $($InfFileInstallPath) (Step 1 of 4)" -ForegroundColor Green
+
+        # - Install Printer Driver with PowerShell
+            Add-PrinterDriver -Name $PrinterDriverName
+                Write-Host "Installed PrinterDriver $($PrinterDriverName) (Step 2 of 4)" -ForegroundColor Green
+        
+        # - Add PrinterPort with PowerShell
+            $PrintDevicePortName = "PORT_$($PrinterHostorIPAddress)"
+            Add-printerport -Name $PrintDevicePortName -PrinterHostAddress $PrinterHostorIPAddress
+                Write-Host "Added Printer Port $($PrintDevicePortName) (Step 3 of 4)" -ForegroundColor Green
+
+        # - Add Printer with PowerShell
+            Add-Printer -Name $PrinterDisplayName -DriverName $PrinterDriverName -PortName $PrintDevicePortName
+                Write-Host "Added Printer $($PrinterDisplayName) (Step 4 of 4)" -ForegroundColor Green
+            
+        # - Set Default Printer if selected
+        if ($DefaultPrinter) {
+            Invoke-CimMethod -ClassName Win32_Printer -MethodName SetDefaultPrinter -Arguments @{Name=$PrinterDisplayName}
+                Write-Host "Set as default printer" -ForegroundColor Green
+        }
+    }
+    catch {
+        Write-Host "An error has occurred: $($_)" -ForegroundColor Red
+        Return 1
+    }
+}
+
+
+
+function Remove-LocalPrinter {
+    param (
+        $PrinterDisplayName
+    )
+
+    $PrinterDisplayName = "Xerox WorkCentre 5335"
+try {
+    $prtr = Get-Printer -Name $PrinterDisplayName -ErrorAction SilentlyContinue;
+    if ($prtr.count -eq 1) {
+        Write-Verbose "Printer found! Name: $($prtr.Name)   Port: $($prtr.PortName) Driver: $($prtr.DriverName)"
+        Restart-Service spooler
+        Write-Host "Restarted Print Spooler (Step 1 of 4)"
+    } elseif ($prtr.count -gt 1) {
+        Throw "ERROR: $($prtr.count) printers found! Too many printers. Narrow search and try again"
+    } else {
+        Throw "ERROR: No printers found! Too many printers. Narrow search and try again"
+    }
+    Remove-Printer -Name $prtr.Name
+        Write-Host"SUCCESS: Removed Printer $($prtr.Name) (Step 2 of 4)" -foregroundcolor Green
+    $PortCheck = get-printer | Where-Object {$_.PortName -eq $prtr.PortName}
+        if ($PortCheck) {
+            Write-Host "WARNING: The Printer Port $($prtr.PortName) associated with deleted printer $($prtr.Name) is also in use by other printers. Skipping removal. (Step 3 of 4)" -ForegroundColor Yellow
+        } else {
+            Get-PrinterPort -name $prtr.PortName | Remove-PrinterPort
+            Write-Host "SUCCESS: Removed Printer Port $($prtr.PortName) (Step 3 of 4)" -ForegroundColor Green
+        }
+    $DriverCheck = get-printer | Where-Object {$_.DriverName -eq $prtr.DriverName}
+    if ($DriverCheck) {
+            Write-Host "WARNING: The Printer Driver $($prtr.DriverName) associated with deleted printer $($prtr.Name) is also in use by other printers. Skipping removal. (Step 4 of 4)" -ForegroundColor Yellow
+        } else {
+            Get-PrinterDriver -name $prtr.DriverName | Remove-PrinterDriver
+            Write-Host "SUCCESS: Removed Printer Driver $($prtr.DriverName) (Step 4 of 4)" -ForegroundColor Green
+        }
+}
+catch {
+    Write-Host "An error has occurred: $($_)" -ForegroundColor Red
+    Return 1
+}
+}
+
+function Export-PrinterInfo {
+    param (
+        $PrinterDisplayName,
+        $ExportDir = "C:\RTSupport\PrinterExport"
+    )
+    if (!$PrinterDisplayName) {$PrinterDisplayName = Read-Host -Prompt "Enter the name of the printer to export"}
+    if (!(Test-Path $ExportDir)) {new-item $ExportDir -ItemType Directory -Force > $null};   
+    $prtr = Get-Printer -Name $PrinterDisplayName;
+    $drvr = Get-PrinterDriver -Name $prtr.DriverName;
+    $port = Get-PrinterPort -Name $prtr.PortName;
+    $ExportDriverZipPath = "$($ExportDir)\$($drvr.Name.Replace('(','').replace(')','').replace(' ','_'))_$($drvr.PrinterEnvironment.replace(' ','_')).zip"
+
+    Write-Host "";
+    Write-Host "Copy this stuff down";
+    Write-Host "";
+    Write-Host "Printer Display Name:           $($Prtr.Name)";
+    Write-Host "Printer Driver Name:            $($Prtr.DriverName)";
+    Write-Host "Printer Driver Environment:     $($drvr.PrinterEnvironment)";
+    Write-Host "HostOrIPAddress:                $($port.PrinterHostAddress)";
+    Write-Host "Driver .inf file:               $($drvr.InfPath.split('\')[-1])";
+    Write-Host "Driver Export.zip path:         $($ExportDriverZipPath)";
+
+    $gci = gci $drvr.InfPath; 
+    Compress-Archive -Path $gci.DirectoryName -DestinationPath $ExportDriverZipPath;
+    
+    Write-Host "";
+    Write-Host "Driver Exported Successfully";
+}
