@@ -365,3 +365,767 @@ function PCDIAG-IPLookupToClipboard {
 }
 
 
+
+###############################################################################
+###                                                                         ###
+###    PCDiag-GetDomainSPFConfiguration                                     ###
+###                                                                         ###
+###    Check a Domain's SPF Setup                                           ###
+###                                                                         ###
+###############################################################################
+
+
+
+function PCDiag-GetDomainSPFConfiguration {
+
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [Alias("Name","DomainName")]
+        [string]$Domain
+    )
+
+    begin {
+
+        function Get-SPFRecord {
+            param([string]$Domain)
+
+            try {
+                $records = Resolve-DnsName -Name $Domain -Type TXT -ErrorAction Stop
+
+                return $records | Where-Object {
+                    ($_.Strings -join '') -match '^v=spf1'
+                }
+            }
+            catch {
+                return $null
+            }
+        }
+
+        function Test-Include {
+
+            param(
+                [string]$Domain,
+                [hashtable]$Visited
+            )
+
+            if ($Visited.ContainsKey($Domain)) {
+                return
+            }
+
+            $Visited[$Domain] = $true
+
+            $spf = Get-SPFRecord $Domain
+
+            if (!$spf) {
+                return
+            }
+
+            $record = ($spf.Strings -join '')
+
+            foreach ($include in ([regex]::Matches($record,'include:([^\s]+)'))) {
+
+                $script:LookupCount++
+
+                Test-Include -Domain $include.Groups[1].Value -Visited $Visited
+            }
+
+            foreach ($pattern in @(
+                    'include:',
+                    'exists:',
+                    'redirect=',
+                    ' a:',
+                    ' mx'
+                )) {
+
+                $script:LookupCount += ([regex]::Matches($record,[regex]::Escape($pattern))).Count
+            }
+        }
+    }
+
+    process {
+
+        $script:LookupCount = 0
+        $visited = @{}
+
+        $Issues = New-Object System.Collections.Generic.List[string]
+        $Warnings = New-Object System.Collections.Generic.List[string]
+
+        $spf = Get-SPFRecord $Domain
+
+        if (!$spf) {
+
+            return [pscustomobject]@{
+                Domain      = $Domain
+                Exists      = $false
+                Score       = 0
+                Health      = "Critical"
+                SPFRecord   = $null
+                LookupCount = 0
+                Issues      = @("No SPF record found.")
+                Warnings    = @()
+            }
+        }
+
+        if ($spf.Count -gt 1) {
+            $Issues.Add("Multiple SPF records detected.")
+        }
+
+        $record = ($spf.Strings -join '')
+
+        if ($record.Length -gt 450) {
+            $Warnings.Add("Record is approaching the DNS length limit.")
+        }
+
+        if ($record -match "\+all") {
+            $Issues.Add("'+all' completely disables SPF protection.")
+        }
+
+        if ($record -match "\?all") {
+            $Issues.Add("'?all' (Neutral) is not recommended.")
+        }
+
+        if ($record -match "~all") {
+            $Warnings.Add("Using SoftFail (~all). Consider '-all' if possible.")
+        }
+
+        if ($record -notmatch "[-~?+]all") {
+            $Issues.Add("Missing ALL mechanism.")
+        }
+
+        if ($record -match "\sptr") {
+            $Issues.Add("Uses deprecated PTR mechanism.")
+        }
+
+        $includes = [regex]::Matches($record,'include:([^\s]+)')
+
+        if ($includes.Count -gt 5) {
+            $Warnings.Add("High number of include statements ($($includes.Count)).")
+        }
+
+        $duplicates = $record.Split(" ") |
+            Group-Object |
+            Where-Object Count -gt 1
+
+        foreach ($dup in $duplicates) {
+            $Warnings.Add("Duplicate mechanism: $($dup.Name)")
+        }
+
+        Test-Include -Domain $Domain -Visited $visited
+
+        if ($LookupCount -gt 10) {
+            $Issues.Add("SPF exceeds the RFC limit of 10 DNS lookups.")
+        }
+        elseif ($LookupCount -gt 8) {
+            $Warnings.Add("SPF is close to the 10 lookup limit.")
+        }
+
+        $score = 100
+        $score -= ($Issues.Count * 20)
+        $score -= ($Warnings.Count * 5)
+
+        if ($score -lt 0) { $score = 0 }
+
+        $health = switch ($score) {
+            {$_ -ge 95} { "Excellent"; break }
+            {$_ -ge 80} { "Good"; break }
+            {$_ -ge 60} { "Fair"; break }
+            default     { "Poor" }
+        }
+
+        [pscustomobject]@{
+            Domain          = $Domain
+            Exists          = $true
+            Health          = $health
+            Score           = $score
+            SPFRecord       = $record
+            LookupCount     = $LookupCount
+            IncludeCount    = $includes.Count
+            IssueCount      = $Issues.Count
+            WarningCount    = $Warnings.Count
+            Issues          = $Issues
+            Warnings        = $Warnings
+            RecommendedFail = ($record -match "-all")
+        }
+    }
+}
+
+###############################################################################
+###                                                                         ###
+###    PCDiag-GetDomainDMARCConfiguration                                   ###
+###                                                                         ###
+###    Check a Domain's DMARC Config                                        ###
+###                                                                         ###
+###############################################################################
+
+function PCDiag-GetDomainDMARCConfiguration {
+
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory,ValueFromPipeline,ValueFromPipelineByPropertyName)]
+        [Alias("Name","DomainName")]
+        [string]$Domain
+    )
+
+    begin {
+
+        function Get-DMARCRecord {
+            param([string]$Domain)
+
+            try {
+
+                Resolve-DnsName `
+                    -Name "_dmarc.$Domain" `
+                    -Type TXT `
+                    -ErrorAction Stop |
+                Where-Object {
+                    ($_.Strings -join "") -match "^v=DMARC1"
+                }
+
+            }
+            catch {
+                $null
+            }
+        }
+
+    }
+
+    process {
+
+        $Issues   = [System.Collections.Generic.List[string]]::new()
+        $Warnings = [System.Collections.Generic.List[string]]::new()
+
+        $Record = Get-DMARCRecord $Domain
+
+        if(!$Record){
+
+            return [pscustomobject]@{
+                Domain          = $Domain
+                Exists          = $false
+                Health          = "Critical"
+                Score           = 0
+                DMARCRecord     = $null
+                Policy          = $null
+                AlignmentDKIM   = $null
+                AlignmentSPF    = $null
+                Rua             = @()
+                Ruf             = @()
+                IssueCount      = 1
+                WarningCount    = 0
+                Issues          = @("No DMARC record found.")
+                Warnings        = @()
+            }
+
+        }
+
+        if($Record.Count -gt 1){
+            $Issues.Add("Multiple DMARC records detected.")
+        }
+
+        $Text = ($Record.Strings -join "")
+
+        $Tags = @{}
+
+        foreach($pair in $Text -split ";"){
+
+            if($pair.Trim() -match "^(.+?)=(.+)$"){
+
+                $Tags[$Matches[1].Trim().ToLower()] =
+                    $Matches[2].Trim()
+
+            }
+
+        }
+
+        #
+        # Required Version
+        #
+
+        if($Tags.v -ne "DMARC1"){
+            $Issues.Add("Invalid DMARC version.")
+        }
+
+        #
+        # Policy
+        #
+
+        if(!$Tags.ContainsKey("p")){
+            $Issues.Add("Missing required policy (p=).")
+        }
+
+        switch($Tags.p){
+
+            "none" {
+                $Warnings.Add("Policy is set to 'none'. Monitoring only.")
+            }
+
+            "quarantine" {
+            }
+
+            "reject" {
+            }
+
+            default {
+                $Issues.Add("Invalid policy value.")
+            }
+
+        }
+
+        #
+        # Percentage
+        #
+
+        if($Tags.ContainsKey("pct")){
+
+            try{
+
+                $pct=[int]$Tags.pct
+
+                if($pct -lt 100){
+                    $Warnings.Add("Policy only applies to $pct% of messages.")
+                }
+
+            }
+            catch{
+                $Issues.Add("Invalid pct value.")
+            }
+
+        }
+
+        #
+        # rua reports
+        #
+
+        if(!$Tags.ContainsKey("rua")){
+            $Warnings.Add("Aggregate reporting (rua) not configured.")
+        }
+
+        #
+        # ruf reports
+        #
+
+        if(!$Tags.ContainsKey("ruf")){
+            $Warnings.Add("Forensic reporting (ruf) not configured.")
+        }
+
+        #
+        # Alignment
+        #
+
+        if($Tags.ContainsKey("adkim")){
+
+            if($Tags.adkim -notin @("r","s")){
+                $Issues.Add("Invalid DKIM alignment mode.")
+            }
+
+            if($Tags.adkim -eq "r"){
+                $Warnings.Add("DKIM alignment is relaxed.")
+            }
+
+        }
+
+        if($Tags.ContainsKey("aspf")){
+
+            if($Tags.aspf -notin @("r","s")){
+                $Issues.Add("Invalid SPF alignment mode.")
+            }
+
+            if($Tags.aspf -eq "r"){
+                $Warnings.Add("SPF alignment is relaxed.")
+            }
+
+        }
+
+        #
+        # Report Interval
+        #
+
+        if($Tags.ContainsKey("ri")){
+
+            try{
+
+                if([int]$Tags.ri -gt 86400){
+                    $Warnings.Add("Report interval exceeds 24 hours.")
+                }
+
+            }
+            catch{
+                $Issues.Add("Invalid report interval.")
+            }
+
+        }
+
+        #
+        # Unknown Tags
+        #
+
+        $KnownTags=@(
+            "v","p","sp","pct",
+            "rua","ruf",
+            "ri","fo",
+            "adkim","aspf"
+        )
+
+        foreach($Tag in $Tags.Keys){
+
+            if($Tag -notin $KnownTags){
+
+                $Warnings.Add("Unknown tag: $Tag")
+
+            }
+
+        }
+
+        #
+        # Health Score
+        #
+
+        $Score=100
+
+        $Score-=($Issues.Count*20)
+        $Score-=($Warnings.Count*5)
+
+        if($Score -lt 0){
+            $Score=0
+        }
+
+        $Health=switch($Score){
+
+            {$_ -ge 95} {"Excellent";break}
+            {$_ -ge 80} {"Good";break}
+            {$_ -ge 60} {"Fair";break}
+            default     {"Poor"}
+
+        }
+
+        [pscustomobject]@{
+
+            Domain          = $Domain
+            Exists          = $true
+            Health          = $Health
+            Score           = $Score
+
+            DMARCRecord     = $Text
+
+            Policy          = $Tags.p
+            SubdomainPolicy = $Tags.sp
+
+            AlignmentDKIM   = $Tags.adkim
+            AlignmentSPF    = $Tags.aspf
+
+            Percentage      = $Tags.pct
+            ReportInterval  = $Tags.ri
+
+            Rua             = if($Tags.rua){$Tags.rua -split ","}else{@()}
+            Ruf             = if($Tags.ruf){$Tags.ruf -split ","}else{@()}
+
+            IssueCount      = $Issues.Count
+            WarningCount    = $Warnings.Count
+
+            Issues          = $Issues
+            Warnings        = $Warnings
+
+            Enforced        = ($Tags.p -eq "reject")
+        }
+
+    }
+
+}
+
+
+###############################################################################
+###                                                                         ###
+###    PCDiag-GetDomainDKIMConfiguration                                    ###
+###                                                                         ###
+###    Check a Domain's DKIM Config                                         ###
+###                                                                         ###
+###############################################################################
+
+
+function PCDiag-GetDomainDKIMConfiguration {
+
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory,ValueFromPipeline,ValueFromPipelineByPropertyName)]
+        [Alias("Name","DomainName")]
+        [string]$Domain,
+
+        [string[]]$Selectors = @(
+            "selector1",
+            "selector2",
+            "default",
+            "google",
+            "k1",
+            "dkim",
+            "mail",
+            "smtp",
+            "s1",
+            "s2"
+        )
+    )
+
+    begin {
+
+        function Get-DKIMRecord {
+
+            param(
+                [string]$Domain,
+                [string]$Selector
+            )
+
+            try {
+
+                Resolve-DnsName `
+                    -Name "$Selector._domainkey.$Domain" `
+                    -Type TXT `
+                    -ErrorAction Stop |
+                Where-Object {
+                    ($_.Strings -join "") -match "v=DKIM1"
+                }
+
+            }
+            catch {
+                $null
+            }
+
+        }
+
+    }
+
+    process {
+
+        $Issues   = [System.Collections.Generic.List[string]]::new()
+        $Warnings = [System.Collections.Generic.List[string]]::new()
+        $Found    = [System.Collections.Generic.List[object]]::new()
+
+        foreach($Selector in $Selectors){
+
+            $Record = Get-DKIMRecord -Domain $Domain -Selector $Selector
+
+            if(!$Record){
+                continue
+            }
+
+            if($Record.Count -gt 1){
+                $Warnings.Add("Multiple DKIM records found for selector '$Selector'.")
+            }
+
+            $Text = ($Record.Strings -join "")
+
+            $Tags=@{}
+
+            foreach($Pair in $Text -split ";"){
+
+                if($Pair.Trim() -match "^(.+?)=(.+)$"){
+
+                    $Tags[$Matches[1].Trim().ToLower()] =
+                        $Matches[2].Trim()
+
+                }
+
+            }
+
+            #
+            # Version
+            #
+
+            if($Tags.v -ne "DKIM1"){
+                $Issues.Add("Invalid DKIM version for selector '$Selector'.")
+            }
+
+            #
+            # Public Key
+            #
+
+            if(!$Tags.ContainsKey("p")){
+                $Issues.Add("Missing public key for selector '$Selector'.")
+            }
+            elseif([string]::IsNullOrWhiteSpace($Tags.p)){
+                $Warnings.Add("Selector '$Selector' appears revoked (empty public key).")
+            }
+
+            #
+            # Key Type
+            #
+
+            if($Tags.ContainsKey("k")){
+
+                if($Tags.k -ne "rsa"){
+                    $Warnings.Add("Selector '$Selector' uses uncommon key type '$($Tags.k)'.")
+                }
+
+            }
+
+            #
+            # Service Type
+            #
+
+            if($Tags.ContainsKey("s")){
+
+                if($Tags.s -notmatch "email|\*"){
+                    $Warnings.Add("Selector '$Selector' has unexpected service type '$($Tags.s)'.")
+                }
+
+            }
+
+            #
+            # Flags
+            #
+
+            if($Tags.ContainsKey("t")){
+
+                if($Tags.t -match "y"){
+                    $Warnings.Add("Selector '$Selector' is in testing mode.")
+                }
+
+            }
+
+            #
+            # Estimate Key Size
+            #
+
+            $EstimatedBits = $null
+
+            if($Tags.ContainsKey("p")){
+
+                $EstimatedBits = [Math]::Round(($Tags.p.Length * 6) / 8) * 8
+
+                if($EstimatedBits -lt 1024){
+                    $Issues.Add("Selector '$Selector' appears to use a weak key (<1024 bits).")
+                }
+                elseif($EstimatedBits -lt 2048){
+                    $Warnings.Add("Selector '$Selector' appears to use a 1024-bit key.")
+                }
+
+            }
+
+            $Found.Add([PSCustomObject]@{
+
+                Selector = $Selector
+                KeyType  = $Tags.k
+                KeyBits  = $EstimatedBits
+                Flags    = $Tags.t
+                Service  = $Tags.s
+                Record   = $Text
+
+            })
+
+        }
+
+        if($Found.Count -eq 0){
+
+            return [PSCustomObject]@{
+
+                Domain          = $Domain
+                Exists          = $false
+                Health          = "Critical"
+                Score           = 0
+
+                SelectorCount   = 0
+                Selectors       = @()
+
+                IssueCount      = 1
+                WarningCount    = 0
+
+                Issues          = @("No DKIM records found using the supplied selectors.")
+                Warnings        = @()
+
+            }
+
+        }
+
+        #
+        # Score
+        #
+
+        $Score = 100
+
+        $Score -= ($Issues.Count * 20)
+        $Score -= ($Warnings.Count * 5)
+
+        if($Score -lt 0){
+            $Score = 0
+        }
+
+        $Health = switch($Score){
+
+            {$_ -ge 95} {"Excellent";break}
+            {$_ -ge 80} {"Good";break}
+            {$_ -ge 60} {"Fair";break}
+            default     {"Poor"}
+
+        }
+
+        [PSCustomObject]@{
+
+            Domain          = $Domain
+            Exists          = $true
+
+            Health          = $Health
+            Score           = $Score
+
+            SelectorCount   = $Found.Count
+            Selectors       = $Found
+
+            IssueCount      = $Issues.Count
+            WarningCount    = $Warnings.Count
+
+            Issues          = $Issues
+            Warnings        = $Warnings
+
+        }
+
+    }
+
+}
+
+###############################################################################
+###                                                                         ###
+###    PCDiag-GetDomainWhoisRDAP                                            ###
+###                                                                         ###
+###    Check a Domain's Registration using RDAP                             ###
+###                                                                         ###
+###############################################################################
+
+function PCDiag-GetDomainWhoisRDAP {
+    param (
+        $Domain
+    )
+    return irm "https://rdap.org/domain/$($Domain)"
+}
+
+###############################################################################
+###                                                                         ###
+###    PCDIAG-CheckEmailConfigudation                                       ###
+###                                                                         ###
+###    Check a Domain's Email configuration                                 ###
+###                                                                         ###
+###############################################################################
+
+function PCDIAG-CheckEmailDomainSetup {
+    param (
+        $Domain
+    )
+    $DKIM  = PCDiag-GetDomainDKIMConfiguration -Domain $domain
+    $DMARC = PCDiag-GetDomainDMARCConfiguration -Domain $domain
+    $SPF   = PCDiag-GetDomainSPFConfiguration -Domain $domain
+
+    $DomainReport = [PSCustomObject]@{
+        Domain          =   $Domain
+        EmailSecurity   =   [PSCustomObject]@{
+            SPF = $SPF
+            DMARC = $DMARC
+            DKIM = $DKIM
+        }
+        Overall         =   [PSCustomObject]@{
+            Score       =   ($SPF.Score, $DKIM.Score, $DMARC.Score | Measure-Object -Average).Average
+            Health      =   switch ($DomainReport.Overall.Score) {
+                                {$_ -ge 95} { "Excellent"; break }
+                                {$_ -ge 80} { "Good"; break }
+                                {$_ -ge 60} { "Fair"; break }
+                                default     { "Poor" }
+                            }
+        }
+    }
+    return $DomainReport
+}
