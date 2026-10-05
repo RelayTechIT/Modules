@@ -1,8 +1,19 @@
 
+### Table of Contents:
+###    1.    PCDiag-GetGDUSizeInBytes - Quickly provides file or folder size, in bytes 
+###    2.    PCDIAG-GetLocalProfileSize - Gets the size on disk of all local user profiles
+###    3.    PCDiag-DiskCleanup - Aggressive cleanup of a system with low disk space
+###    4.    PCDIAG-IPLookupToClipboard - Copy IP Information to windows clipboard to paste into excel
+###    5.    PCDiag-GetDomainSPFConfiguration - Check a Domain's SPF Setup
+###    6.    PCDiag-GetDomainDMARCConfiguration - Check a Domain's DMARC Config
+###    7.    PCDiag-GetDomainDKIMConfiguration - Check a Domain's DKIM Config
+###    8.    PCDiag-GetDomainWhoisRDAP - Check a Domain's Registration using RDAP
+###    9.    PCDIAG-CheckEmailConfigudation - Check a Domain's Email configuration
+
 
 ###############################################################################
 ###                                                                         ###
-###    PCDiag-GetGDUSizeInBytes                                             ###
+###    1.    PCDiag-GetGDUSizeInBytes                                       ###
 ###                                                                         ###
 ###    Quickly provides file or folder size, in bytes                       ###
 ###                                                                         ###
@@ -29,7 +40,7 @@ function PCDiag-GetGDUSizeInBytes {
 
 ###############################################################################
 ###                                                                         ###
-###    PCDIAG-GetLocalProfileSize                                           ###
+###    2.    PCDIAG-GetLocalProfileSize                                     ###
 ###                                                                         ###
 ###    Gets the size on disk of all local user profiles                     ###
 ###                                                                         ###
@@ -59,7 +70,7 @@ function PCDIAG-GetLocalProfileSize {
 
 ###############################################################################
 ###                                                                         ###
-###    PCDiag-DiskCleanup                                                   ###
+###    3.    PCDiag-DiskCleanup                                             ###
 ###                                                                         ###
 ###    Aggressive cleanup of a system with low disk space                   ###
 ###                                                                         ###
@@ -348,7 +359,7 @@ Function PCDiag-DiskCleanup {
 
 ###############################################################################
 ###                                                                         ###
-###    PCDIAG-IPLookupToClipboard                                           ###
+###    4.    PCDIAG-IPLookupToClipboard                                     ###
 ###                                                                         ###
 ###    Copy IP Information to windows clipboard to paste into excel         ###
 ###                                                                         ###
@@ -368,7 +379,7 @@ function PCDIAG-IPLookupToClipboard {
 
 ###############################################################################
 ###                                                                         ###
-###    PCDiag-GetDomainSPFConfiguration                                     ###
+###    5.    PCDiag-GetDomainSPFConfiguration                               ###
 ###                                                                         ###
 ###    Check a Domain's SPF Setup                                           ###
 ###                                                                         ###
@@ -552,7 +563,7 @@ function PCDiag-GetDomainSPFConfiguration {
 
 ###############################################################################
 ###                                                                         ###
-###    PCDiag-GetDomainDMARCConfiguration                                   ###
+###    6.    PCDiag-GetDomainDMARCConfiguration                             ###
 ###                                                                         ###
 ###    Check a Domain's DMARC Config                                        ###
 ###                                                                         ###
@@ -835,7 +846,7 @@ function PCDiag-GetDomainDMARCConfiguration {
 
 ###############################################################################
 ###                                                                         ###
-###    PCDiag-GetDomainDKIMConfiguration                                    ###
+###    7.    PCDiag-GetDomainDKIMConfiguration                              ###
 ###                                                                         ###
 ###    Check a Domain's DKIM Config                                         ###
 ###                                                                         ###
@@ -1081,7 +1092,7 @@ function PCDiag-GetDomainDKIMConfiguration {
 
 ###############################################################################
 ###                                                                         ###
-###    PCDiag-GetDomainWhoisRDAP                                            ###
+###    8.    PCDiag-GetDomainWhoisRDAP                                      ###
 ###                                                                         ###
 ###    Check a Domain's Registration using RDAP                             ###
 ###                                                                         ###
@@ -1096,7 +1107,7 @@ function PCDiag-GetDomainWhoisRDAP {
 
 ###############################################################################
 ###                                                                         ###
-###    PCDIAG-CheckEmailConfigudation                                       ###
+###    9.    PCDIAG-CheckEmailConfigudation                                 ###
 ###                                                                         ###
 ###    Check a Domain's Email configuration                                 ###
 ###                                                                         ###
