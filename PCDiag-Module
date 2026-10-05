@@ -458,7 +458,8 @@ function PCDiag-GetDomainSPFConfiguration {
     param(
         [Parameter(Mandatory, ValueFromPipeline, ValueFromPipelineByPropertyName)]
         [Alias("Name","DomainName")]
-        [string]$Domain
+        [string]$Domain,
+		[string]$DNSServer
     )
 
     begin {
@@ -467,7 +468,11 @@ function PCDiag-GetDomainSPFConfiguration {
             param([string]$Domain)
 
             try {
-                $records = Resolve-DnsName -Name $Domain -Type TXT -ErrorAction Stop
+				if ($DNSServer) {
+					$records = Resolve-DnsName -Name $Domain -Type TXT -Server $DNSServer -ErrorAction Stop
+				} else {
+					$records = Resolve-DnsName -Name $Domain -Type TXT -ErrorAction Stop
+				}
 
                 return $records | Where-Object {
                     ($_.Strings -join '') -match '^v=spf1'
@@ -640,7 +645,8 @@ function PCDiag-GetDomainDMARCConfiguration {
     param(
         [Parameter(Mandatory,ValueFromPipeline,ValueFromPipelineByPropertyName)]
         [Alias("Name","DomainName")]
-        [string]$Domain
+        [string]$Domain,
+		[string]$DNSServer
     )
 
     begin {
@@ -649,21 +655,16 @@ function PCDiag-GetDomainDMARCConfiguration {
             param([string]$Domain)
 
             try {
-
-                Resolve-DnsName `
-                    -Name "_dmarc.$Domain" `
-                    -Type TXT `
-                    -ErrorAction Stop |
-                Where-Object {
-                    ($_.Strings -join "") -match "^v=DMARC1"
-                }
-
+				if ($DNSServer) {
+					Resolve-DnsName -Name "_dmarc.$Domain" -Type TXT -Server $DNSServer -ErrorAction Stop | Where-Object {($_.Strings -join "") -match "^v=DMARC1"}
+				} else {
+					Resolve-DnsName -Name "_dmarc.$Domain" -Type TXT -ErrorAction Stop | Where-Object {($_.Strings -join "") -match "^v=DMARC1"}
+				}
             }
             catch {
                 $null
             }
         }
-
     }
 
     process {
@@ -925,7 +926,7 @@ function PCDiag-GetDomainDKIMConfiguration {
         [Parameter(Mandatory,ValueFromPipeline,ValueFromPipelineByPropertyName)]
         [Alias("Name","DomainName")]
         [string]$Domain,
-
+		[string]$DNSServer,
         [string[]]$Selectors = @(
             "selector1",
             "selector2",
@@ -950,22 +951,16 @@ function PCDiag-GetDomainDKIMConfiguration {
             )
 
             try {
-
-                Resolve-DnsName `
-                    -Name "$Selector._domainkey.$Domain" `
-                    -Type TXT `
-                    -ErrorAction Stop |
-                Where-Object {
-                    ($_.Strings -join "") -match "v=DKIM1"
-                }
-
+				if ($DNSServer) {
+					Resolve-DnsName -Name "$Selector._domainkey.$Domain" -Type TXT -Server $DNSServer -ErrorAction Stop | Where-Object {($_.Strings -join "") -match "v=DKIM1"}
+				} else {
+					Resolve-DnsName -Name "$Selector._domainkey.$Domain" -Type TXT -ErrorAction Stop | Where-Object {($_.Strings -join "") -match "v=DKIM1"}
+				}
             }
             catch {
                 $null
             }
-
         }
-
     }
 
     process {
