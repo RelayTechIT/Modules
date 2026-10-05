@@ -1,14 +1,15 @@
 
 ### Table of Contents:
 ###    1.    PCDiag-GetGDUSizeInBytes - Quickly provides file or folder size, in bytes 
-###    2.    PCDIAG-GetLocalProfileSize - Gets the size on disk of all local user profiles
-###    3.    PCDiag-DiskCleanup - Aggressive cleanup of a system with low disk space
-###    4.    PCDIAG-IPLookupToClipboard - Copy IP Information to windows clipboard to paste into excel
-###    5.    PCDiag-GetDomainSPFConfiguration - Check a Domain's SPF Setup
-###    6.    PCDiag-GetDomainDMARCConfiguration - Check a Domain's DMARC Config
-###    7.    PCDiag-GetDomainDKIMConfiguration - Check a Domain's DKIM Config
-###    8.    PCDiag-GetDomainWhoisRDAP - Check a Domain's Registration using RDAP
-###    9.    PCDIAG-CheckEmailConfigudation - Check a Domain's Email configuration
+###    2.    PCDiag-FindLargeFolders - Quickly searches for large subfolders over a specific size (REQUIRES: PCDiag-GetGDUSizeInBytes)
+###    3.    PCDIAG-GetLocalProfileSize - Gets the size on disk of all local user profiles
+###    4.    PCDiag-DiskCleanup - Aggressive cleanup of a system with low disk space
+###    5.    PCDIAG-IPLookupToClipboard - Copy IP Information to windows clipboard to paste into excel
+###    6.    PCDiag-GetDomainSPFConfiguration - Check a Domain's SPF Setup
+###    7.    PCDiag-GetDomainDMARCConfiguration - Check a Domain's DMARC Config
+###    8.    PCDiag-GetDomainDKIMConfiguration - Check a Domain's DKIM Config
+###    9.    PCDiag-GetDomainWhoisRDAP - Check a Domain's Registration using RDAP
+###    10.   PCDIAG-CheckEmailDomainSetup - Check a Domain's Email configuration
 
 
 ###############################################################################
@@ -40,7 +41,71 @@ function PCDiag-GetGDUSizeInBytes {
 
 ###############################################################################
 ###                                                                         ###
-###    2.    PCDIAG-GetLocalProfileSize                                     ###
+###    2.    PCDiag-FindLargeFolders                                        ###
+###                                                                         ###
+###    Quickly provides file or folder size, in bytes                       ###
+###                                                                         ###
+###############################################################################
+
+function PCDiag-FindLargeFolders {
+    param(
+        $BaseDirectory = $pwd,
+        $MinimumSizeGB
+    )
+	$RequiredFunctions = "PCDiag-GetGDUSizeInBytes"
+	$RequiredFunctions | foreach {
+		if (!(Get-Command $_ -ea SilentlyContinue)) {
+			$err++
+		}
+	}
+	if ($err) {
+		Write-Host "The required function $($_) is missing - cannot continue." -foregroundcolor Red
+		Return
+	}
+	
+    if (-not (Test-Path $BaseDirectory -ea SilentlyContinue)) {
+        Write-Error "Path '$BaseDirectory' does not exist."
+        return
+    }
+	if ($MinimumSizeGB) {
+		Write-Host "Searching the path: $($BaseDirectory) for folders lager than $($MinimumSizeGB) GB"
+	} else {
+		Write-Host "Searching the path: $($BaseDirectory) for folders of any size"
+	}
+	
+    $results = @()
+    $SubFolders = Get-ChildItem -Path $BaseDirectory -Directory
+    foreach ($SubFolder in $SubFolders.FullName) {
+        
+        if ($SubFolder -eq "$($BaseDirectory)Windows") {
+            Write-Host "Excluding folder $($SubFolder.FullName)"
+        } elseif ($SubFolder -eq "$($BaseDirectory)Users") {
+            Write-Host "Excluding folder $($SubFolder.FullName)"
+        } elseif ($SubFolder -eq "$($BaseDirectory)Program Files") {
+            Write-Host "Excluding folder Program Files"
+        } elseif ($SubFolder -eq "$($BaseDirectory)Program Files (x86)") {
+            Write-Host "Excluding folder Program Files (x86)"
+        } else {
+			# Write-Host "Getting size of folder $($SubFolder)"
+            $bytes = PCDiag-GetGDUSizeInBytes -Path $SubFolder
+            $Results += @([PSCustomObject]@{
+                Folder  =   $SubFolder
+                Bytes   =   $bytes
+                MB      =   [math]::Round($bytes / 1MB, 2)
+                GB      =   [math]::Round($bytes / 1GB, 2)
+            })
+        }
+    }
+	if ($MinimumSizeGB) {
+		return $results | Where-Object {$_.GB -ge $MinimumSizeGB}
+	} else {
+		return $results
+	}
+}
+
+###############################################################################
+###                                                                         ###
+###    3.    PCDIAG-GetLocalProfileSize                                     ###
 ###                                                                         ###
 ###    Gets the size on disk of all local user profiles                     ###
 ###                                                                         ###
@@ -70,7 +135,7 @@ function PCDIAG-GetLocalProfileSize {
 
 ###############################################################################
 ###                                                                         ###
-###    3.    PCDiag-DiskCleanup                                             ###
+###    4.    PCDiag-DiskCleanup                                             ###
 ###                                                                         ###
 ###    Aggressive cleanup of a system with low disk space                   ###
 ###                                                                         ###
@@ -359,7 +424,7 @@ Function PCDiag-DiskCleanup {
 
 ###############################################################################
 ###                                                                         ###
-###    4.    PCDIAG-IPLookupToClipboard                                     ###
+###    5.    PCDIAG-IPLookupToClipboard                                     ###
 ###                                                                         ###
 ###    Copy IP Information to windows clipboard to paste into excel         ###
 ###                                                                         ###
@@ -379,7 +444,7 @@ function PCDIAG-IPLookupToClipboard {
 
 ###############################################################################
 ###                                                                         ###
-###    5.    PCDiag-GetDomainSPFConfiguration                               ###
+###    6.    PCDiag-GetDomainSPFConfiguration                               ###
 ###                                                                         ###
 ###    Check a Domain's SPF Setup                                           ###
 ###                                                                         ###
@@ -563,7 +628,7 @@ function PCDiag-GetDomainSPFConfiguration {
 
 ###############################################################################
 ###                                                                         ###
-###    6.    PCDiag-GetDomainDMARCConfiguration                             ###
+###    7.    PCDiag-GetDomainDMARCConfiguration                             ###
 ###                                                                         ###
 ###    Check a Domain's DMARC Config                                        ###
 ###                                                                         ###
@@ -846,7 +911,7 @@ function PCDiag-GetDomainDMARCConfiguration {
 
 ###############################################################################
 ###                                                                         ###
-###    7.    PCDiag-GetDomainDKIMConfiguration                              ###
+###    8.    PCDiag-GetDomainDKIMConfiguration                              ###
 ###                                                                         ###
 ###    Check a Domain's DKIM Config                                         ###
 ###                                                                         ###
@@ -1092,7 +1157,7 @@ function PCDiag-GetDomainDKIMConfiguration {
 
 ###############################################################################
 ###                                                                         ###
-###    8.    PCDiag-GetDomainWhoisRDAP                                      ###
+###    9.    PCDiag-GetDomainWhoisRDAP                                      ###
 ###                                                                         ###
 ###    Check a Domain's Registration using RDAP                             ###
 ###                                                                         ###
@@ -1107,7 +1172,7 @@ function PCDiag-GetDomainWhoisRDAP {
 
 ###############################################################################
 ###                                                                         ###
-###    9.    PCDIAG-CheckEmailConfigudation                                 ###
+###    10.    PCDIAG-CheckEmailDomainSetup                                  ###
 ###                                                                         ###
 ###    Check a Domain's Email configuration                                 ###
 ###                                                                         ###
@@ -1117,6 +1182,17 @@ function PCDIAG-CheckEmailDomainSetup {
     param (
         $Domain
     )
+    $RequiredFunctions = "PCDiag-GetDomainDKIMConfiguration","PCDiag-GetDomainDMARCConfiguration","PCDiag-GetDomainSPFConfiguration"
+	$RequiredFunctions | foreach {
+		if (!(Get-Command $_ -ea SilentlyContinue)) {
+			$err++
+		}
+	}
+	if ($err) {
+		Write-Host "The required function $($_) is missing - cannot continue." -foregroundcolor Red
+		Return
+	}
+
     $DKIM  = PCDiag-GetDomainDKIMConfiguration -Domain $domain
     $DMARC = PCDiag-GetDomainDMARCConfiguration -Domain $domain
     $SPF   = PCDiag-GetDomainSPFConfiguration -Domain $domain
